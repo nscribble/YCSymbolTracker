@@ -12,49 +12,73 @@
 #import <sanitizer/coverage_interface.h>
 #import <libkern/OSAtomic.h>
 #import <dlfcn.h>
-
-void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
-  static uint64_t N;  // Counter for the guards.
-  if (start == stop || *start) return;  // Initialize only once.
-//  printf("INIT: %p %p\n", start, stop);
-  for (uint32_t *x = start; x < stop; x++)
-    *x = (uint32_t)++N;  // Guards should start from 1.
-}
-
-void printInfo(void *PC) {
-    Dl_info info;
-    dladdr(PC, &info);
-    printf("fnam:%s \n fbase:%p \n sname:%s \n saddr:%p \n",
-           info.dli_fname,
-           info.dli_fbase,
-           info.dli_sname,
-           info.dli_saddr);
-}
+#import <os/lock.h>
 
 static OSQueueHead symbolList = OS_ATOMIC_QUEUE_INIT;
+static BOOL finished;
+static NSMutableDictionary *mappings;
+static os_unfair_lock lock;
+
+void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
+    static uint64_t N;  // Counter for the guards.
+    if (start == stop || *start) return;  // Initialize only once.
+    
+    for (uint32_t *x = start; x < stop; x++) {
+        *x = (uint32_t)++N;  // Guards should start from 1.
+    }
+    
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        mappings = [NSMutableDictionary dictionaryWithCapacity:1000];
+        lock = OS_UNFAIR_LOCK_INIT;
+    });
+}
 
 typedef struct {
     void *pc;
     void *next;
 } SymbolNode;
 
+// https://clang.llvm.org/docs/SanitizerCoverage.html
+
 void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
-    if (!*guard) return;  // Duplicate the guard check.
+//    if (!*guard) return;  // Duplicate the guard check.
+    if (finished) {
+        *guard = 0;
+        return;
+    }
     
     void *PC = __builtin_return_address(0);
+    
+    int64_t pcw = (int64_t)PC;
+    int32_t pch = (pcw & 0xFFFFFFFF00000000) >> 32;
+    
+    os_unfair_lock_lock(&lock);
+    NSMutableDictionary *sub = [mappings objectForKey:@(pch)];
+    if (sub && sub[@(pcw)]) {
+        os_unfair_lock_unlock(&lock);
+        return;
+    }
+    
+    if (!sub) {
+        sub = [NSMutableDictionary dictionaryWithCapacity:10000];
+        mappings[@(pch)] = sub;
+    }
+    sub[@(pcw)] = @1;
+    os_unfair_lock_unlock(&lock);
     
     SymbolNode * node = malloc(sizeof(SymbolNode));
     *node = (SymbolNode){PC, NULL};
     
     OSAtomicEnqueue(&symbolList, node, offsetof(SymbolNode, next));
-
-//    printInfo(PC);
 }
 
 @implementation YCSymbolTracker
 
 + (BOOL)exportSymbolsWithFilePath:(nonnull NSString *)filePath
 {
+    finished = YES;
+    
     NSMutableArray <NSString *>* symbolNames = [NSMutableArray array];
     while (YES) {
         SymbolNode *node = OSAtomicDequeue(&symbolList, offsetof(SymbolNode, next));
